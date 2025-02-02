@@ -9,7 +9,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
 serde_yaml = "0.9.34"
-libmpv2 = { version = "4.1.0" }
+libmpv2 = { version = "4.1.0", use-bindgen = ["bindgen"], features = ["protocols"] }
 ratatui = { version = "0.29.0", default-features = false, features = ["serde"] }
 crossterm = "0.28.1"
 ratatui-image = { version = "4.2.0", default-features = false, features = ["crossterm"] }

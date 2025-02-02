@@ -16,10 +16,12 @@ use crate::keyboard::{*};
 use crate::mpris;
 use crate::popup::PopupState;
 
+use libmpv2::render::{OpenGLInitParams, RenderParam};
 use libmpv2::{*};
 use serde::{Deserialize, Serialize};
 
 use core::panic;
+use std::ffi::CString;
 use std::io::Stdout;
 
 use souvlaki::{MediaControlEvent, MediaControls};
@@ -45,6 +47,77 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use std::thread;
+
+#[cfg(target_os = "linux")]
+use std::os::raw::{c_int, c_void};
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn glXGetProcAddressARB(procName: *const u8) -> *mut c_void;
+}
+
+
+/// An opaque type representing an MPV handle.
+#[repr(C)]
+pub struct mpv_handle {
+    _private: [u8; 0],
+}
+
+/// An opaque type representing an MPV render context.
+#[repr(C)]
+pub struct mpv_render_context {
+    _private: [u8; 0],
+}
+
+/// MPV render parameters are usually passed as an array terminated by an element with a special type.
+/// Check the MPV documentation for the exact layout.
+#[repr(C)]
+pub struct mpv_render_param {
+    pub type_: c_int,    // Parameter type, e.g., a constant defined in MPV headers.
+    pub data: *mut c_void, // Pointer to parameter data. Its interpretation depends on `type_`.
+}
+
+pub fn create_render_context(
+    mpv: *mut mpv_handle,
+    params: Option<&mut [mpv_render_param]>,
+) -> std::result::Result<*mut mpv_render_context, Error> {
+    // Prepare a pointer for the output context.
+    let mut ctx: *mut mpv_render_context = std::ptr::null_mut();
+
+    let params_ptr = match params {
+        Some(slice) => slice.as_mut_ptr(),
+        None => std::ptr::null_mut(),
+    };
+
+    // Call the FFI function inside an unsafe block.
+    let ret = unsafe { 
+        mpv_render_context_create(&mut ctx as *mut *mut mpv_render_context, mpv, params_ptr)
+    };
+
+    if ret == 0 {
+        Ok(ctx)
+    } else {
+        Err(Error::Raw(ret))
+    }
+}
+
+
+extern "C" {
+    /// Create a render context.
+    ///
+    /// `res` is an out-parameter that will point to the new render context on success.
+    /// `mpv` is the mpv handle.
+    /// `params` is a pointer to an array of parameters terminated with an element that has a
+    /// type of 0 (or whatever termination rule MPV uses).
+    ///
+    /// Returns 0 on success or a negative error code on failure.
+    pub fn mpv_render_context_create(
+        res: *mut *mut mpv_render_context,
+        mpv: *mut mpv_handle,
+        params: *mut mpv_render_param,
+    ) -> c_int;
+}
+
 
 /// This represents the playback state of MPV
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -316,15 +389,79 @@ pub struct MpvState {
     pub mpv: Mpv,
 }
 
+fn get_proc_address(name: &str) -> *mut c_void {
+    use std::ffi::CString;
+    let cname = CString::new(name).expect("Failed to create CString");
+    unsafe {
+        glXGetProcAddressARB(cname.as_ptr() as *const u8)
+    }
+}
+
 impl MpvState {
     fn new(config: &Option<serde_json::Value>) -> Self {
         let mpv = Mpv::with_initializer(|mpv| {
             mpv.set_option("msg-level", "ffmpeg/demuxer=no").unwrap();
             Ok(())
         }).expect("[XX] Failed to initiate mpv context");
-        mpv.set_property("vo", "null").unwrap();
+
+        // let api_cstr = CString::new("opengl")
+        //     .expect("CString conversion failed");
+        // let api_ptr = api_cstr.as_ptr() as *mut c_void;
+
+        
+        // let mut param_value: i32 = 42;
+        let local_mpv: *mut mpv_handle = mpv.ctx.as_ptr() as *mut mpv_handle;
+        let mut params = [
+            mpv_render_param {
+                type_: 1, // Replace with the actual parameter type constant.
+                data: CString::new("sw").unwrap().into_raw() as *mut c_void,
+            },
+            // Terminator parameter (adjust according to MPV's expected termination method).
+            mpv_render_param {
+                type_: 0,
+                data: std::ptr::null_mut(),
+            },
+        ];
+
+        // The opengl renderer is probably what i want, but in general needs a lot of setup
+        // need to create a render context -> that needs an opengl context pointer which i dont have
+        // there is a "sw" render method which is slow but could work
+        // file based is out of the question
+        // maybe look into this in the future.
+            
+        // unsafe {
+        //     let init_params = OpenGLInitParams {
+        //         get_proc_address: get_proc_address,
+        //         ctx: local_mpv as *mut c_void,
+        //     };
+        //     let params = vec![
+        //         RenderParam::ApiType(render::RenderParamApiType::OpenGl),
+        //         RenderParam::InitParams(init_params),
+        //         RenderParam::AdvancedControl(true),
+        //     ];
+        //     let render_context = libmpv2::render::RenderContext::new(mpv.ctx.as_mut(), params);
+        // }
+    
+        // let ctx = match create_render_context(local_mpv, Some(&mut params)) {
+        //     Ok(ctx) => {
+        //         // mpv.set_property("wid", ctx).unwrap();
+        //         ctx
+        //     }
+        //     Err(e) => {
+        //         panic!("[XX] Failed to create render context: {:?}", e);
+        //     }
+        // };
+
+        mpv.set_property("vo", "libmpv").unwrap();
+        mpv.set_property("input-vo-keyboard", "yes").unwrap();
         mpv.set_property("volume", 100).unwrap();
         mpv.set_property("prefetch-playlist", "yes").unwrap(); // gapless playback
+        // --gpu-ws
+        mpv.set_property("hwdec", "no").unwrap();
+        // create render context
+
+
+        mpv.set_property("lavfi-complex", "[aid1]asplit[ao][a1];[a1]showwaves=mode=cline:colors=white:rate=9[vo]").unwrap();
 
         // no console output (it shifts the tui around)
         // TODO: can we catch this and show it in a proper area?
@@ -861,7 +998,7 @@ impl App {
 
         loop {
             // main mpv loop
-            let mpv = mpv_state.lock().map_err(|e| format!("Failed to lock mpv_state: {:?}", e))?;
+            let mut mpv = mpv_state.lock().map_err(|e| format!("Failed to lock mpv_state: {:?}", e))?;
 
             let percentage = mpv.mpv.get_property("percent-pos").unwrap_or(0.0);
             let current_index: i64 = mpv.mpv.get_property("playlist-pos").unwrap_or(0);
@@ -869,6 +1006,19 @@ impl App {
             let volume = mpv.mpv.get_property("volume").unwrap_or(0);
             let audio_bitrate = mpv.mpv.get_property("audio-bitrate").unwrap_or(0);
             let file_format = mpv.mpv.get_property("file-format").unwrap_or(String::from(""));
+
+            let event_context = mpv.mpv.event_context_mut();
+            if let Some(event) = event_context.wait_event(0.0) {
+                if let Ok(event) = event {
+                    match event {
+                        libmpv2::events::Event::LogMessage { prefix, level, text, log_level } => {
+                            // panic!("Log message: {:?} {:?} {:?} {:?}", prefix, level, text, log_level);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             drop(mpv);
 
             let _ = sender
