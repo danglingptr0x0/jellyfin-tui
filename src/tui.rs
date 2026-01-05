@@ -20,7 +20,7 @@ use crate::{helpers, mpris, sort};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Sqlite};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use std::collections::HashMap;
 use std::io::{Stdout, Write};
@@ -48,9 +48,11 @@ use crate::database::database::{Command, DownloadCommand, DownloadItem, Jellyfin
 use crate::themes::dialoguer::DialogTheme;
 use dialoguer::Select;
 use std::{env, thread};
-use libmpv2::{Format, Mpv};
+use libmpv2::{Format, Mpv, MpvError};
 use tokio::time::Instant;
 use crate::config::LyricsVisibility;
+use crate::mpris::register_controls;
+use crate::mpv::MpvCommand;
 use crate::themes::theme::Theme;
 
 /// This represents the playback state of MPV
@@ -229,18 +231,19 @@ pub struct App {
     pub downloads_dir: PathBuf,
 
     // mpv is run in a separate thread, this is the handle
+    pub mpv_cmd_tx: tokio::sync::mpsc::Sender<MpvCommand>,
     mpv_thread: Option<thread::JoinHandle<()>>,
-    pub mpv_state: Arc<Mutex<MpvState>>, // shared mutex for controlling mpv
+    // pub mpv_state: Arc<Mutex<MpvState>>, // shared mutex for controlling mpv
     pub song_changed: bool,
 
     pub mpris_paused: bool,
     pub mpris_active_song_id: String,
+    pub mpris_rx: std::sync::mpsc::Receiver<MediaControlEvent>,
 
     pub window_title_enabled: bool,
     pub window_title_format: String,
 
     // every second, we get the playback state from the mpv thread
-    sender: Sender<MpvPlaybackState>,
     pub receiver: Receiver<MpvPlaybackState>,
     // and to avoid a jumpy tui we throttle this update to fast changing values
     pub last_meta_update: Instant,
@@ -322,13 +325,32 @@ impl App {
             network_quality.clone()
         ));
 
-        // connect to mpv, set options and default properties
-        let mpv_state = Arc::new(Mutex::new(MpvState::new(&config)));
+        let mpv = Self::init_mpv(&config);
+        let (mpv_cmd_tx, mpv_cmd_rx) = tokio::sync::mpsc::channel::<MpvCommand>(100);
+
+        let mpv_thread = Some(thread::spawn(move || {
+            Self::mpv_runtime(mpv_cmd_rx, mpv, sender).expect("Failed to run mpv runtime thread");
+        }));
+
+
+        // let cmd = MpvCommand::LoadPlaylist {
+        //     songs: self.state.queue.clone(),
+        //     start_index: self.state.current_playback_state.current_index,
+        //     volume: self.state.current_playback_state.volume,
+        //     repeat: self.preferences.repeat.clone(),
+        // };
+        //
+        // self.mpv_cmd_tx
+        //     .as_ref()
+        //     .unwrap()
+        //     .send(cmd)?;
+
 
         // mpris
+        let (mpris_tx, mpris_rx) = channel();
         let controls = match mpris::mpris() {
             Ok(mut controls) => {
-                Self::register_controls(&mut controls, mpv_state.clone());
+                register_controls(&mut controls, mpris_tx);
                 Some(controls)
             }
             Err(_) => None,
@@ -476,17 +498,18 @@ impl App {
             network_quality,
             discord,
             downloads_dir: data_dir().unwrap().join("jellyfin-tui").join("downloads"),
-            mpv_thread: None,
+            mpv_cmd_tx,
+            mpv_thread,
 
             mpris_paused: true,
             mpris_active_song_id: String::from(""),
+            mpris_rx,
+
             window_title_enabled,
             window_title_format,
 
-            mpv_state,
             song_changed: false,
 
-            sender,
             receiver,
             last_meta_update: Instant::now(),
             recent_input_activity: Instant::now(),
@@ -502,50 +525,11 @@ impl App {
 }
 
 pub struct MpvState {
-    pub mpris_events: Vec<MediaControlEvent>,
-    pub mpv: Mpv,
+    // pub mpris_events: Vec<MediaControlEvent>,
+    // pub mpv: Mpv,
 }
 
 impl MpvState {
-    fn new(config: &serde_yaml::Value) -> Self {
-        let mpv = Mpv::with_initializer(|mpv| {
-            mpv.set_option("msg-level", "ffmpeg/demuxer=no").unwrap();
-            Ok(())
-        })
-        .expect(" [XX] Failed to initiate mpv context");
-        mpv.set_property("vo", "null").unwrap();
-        mpv.set_property("volume", 100).unwrap();
-        mpv.set_property("prefetch-playlist", "yes").unwrap(); // gapless playback
-
-        // no console output (it shifts the tui around)
-        let _ = mpv.set_property("quiet", "yes");
-        let _ = mpv.set_property("really-quiet", "yes");
-
-        // optional mpv options (hah...)
-        if let Some(mpv_config) = config.get("mpv") {
-            if let Some(mpv_config) = mpv_config.as_mapping() {
-                for (key, value) in mpv_config {
-                    if let (Some(key), Some(value)) = (key.as_str(), value.as_str()) {
-                        mpv.set_property(key, value).unwrap_or_else(|e| {
-                            panic!("This is not a valid mpv property {key}: {:?}", e)
-                        });
-                        log::info!("Set mpv property: {} = {}", key, value);
-                    }
-                }
-            } else {
-                log::error!("mpv config is not a mapping");
-            }
-        }
-
-        mpv.disable_deprecated_events().unwrap();
-        mpv.observe_property("volume", Format::Int64, 0).unwrap();
-        mpv.observe_property("demuxer-cache-state", Format::Node, 0)
-            .unwrap();
-        Self {
-            mpris_events: vec![],
-            mpv,
-        }
-    }
 }
 
 impl App {
@@ -1086,7 +1070,7 @@ impl App {
 
     pub async fn run<'a>(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
         // startup: we have to wait for mpv to be ready before seeking to previously saved position
-        self.handle_pending_seek();
+        // self.handle_pending_seek();
 
         // get playback state from the mpv thread
         let _ = self.receive_mpv_state();
@@ -1162,23 +1146,26 @@ impl App {
         Ok(())
     }
 
-    fn handle_pending_seek(&mut self) {
-        if let Some(seek) = self.pending_seek {
-            if let Ok(mpv) = self.mpv_state.lock() {
-                if mpv.mpv.get_property("seekable").unwrap_or(false) {
-                    match mpv.mpv.command("seek", &[&seek.to_string(), "absolute"]) {
-                        Ok(_) => {
-                            self.pending_seek = None;
-                            self.dirty = true;
-                        }
-                        Err(e) => {
-                            log::error!(" ! Failed to seek to {}: {}", seek, e);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // fn handle_pending_seek(&mut self) {
+    //     if let Some(seek) = self.pending_seek {
+    //         if let Ok(mpv) = self.mpv_state.lock() {
+    //             if mpv.mpv.get_property("seekable").unwrap_or(false) {
+    //                 match self.mpv_send(|reply| MpvCommand::Seek {
+    //                     amount: seek,
+    //                     relative: false,
+    //                     reply,
+    //                 }) {
+    //                     Ok(_) => {
+    //                         self.pending_seek = None;
+    //                         self.dirty = true;
+    //                     }
+    //                     Err(e) => {
+    //                         log::error!(" ! Failed to seek to {}: {}", seek, e);
+    //                     }
+    //             }
+    //         }
+    //     }
+    // }
 
     fn receive_mpv_state(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let state = self.receiver.try_recv()?;
@@ -1997,164 +1984,6 @@ impl App {
             }))
             .await;
     }
-
-    pub async fn mpv_start_playlist(
-        &mut self,
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let sender = self.sender.clone();
-        let songs = self.state.queue.clone();
-
-        if self.mpv_thread.is_some() {
-            if let Ok(mpv) = self.mpv_state.lock() {
-                let _ = mpv.mpv.command("stop", &[]);
-                for song in &songs {
-                    match helpers::normalize_mpvsafe_url(&song.url) {
-                        Ok(safe_url) => {
-                            let _ = mpv
-                                .mpv
-                                .command("loadfile", &[safe_url.as_str(), "append-play"]);
-                        }
-                        Err(e) => {
-                            log::error!("Failed to normalize URL '{}': {:?}", song.url, e);
-                            if e.to_string().contains("No such file or directory") {
-                                let _ = self
-                                    .db
-                                    .cmd_tx
-                                    .send(Command::Update(UpdateCommand::OfflineRepair))
-                                    .await;
-                            }
-                        }
-                    }
-                }
-                let _ = mpv.mpv.set_property("pause", false);
-                self.paused = false;
-                self.song_changed = true;
-            }
-            return Ok(());
-        }
-
-        let mpv_state = self.mpv_state.clone();
-        if let Some(ref mut controls) = self.controls {
-            if controls.detach().is_ok() {
-                App::register_controls(controls, mpv_state.clone());
-            }
-        }
-
-        let repeat = self.preferences.repeat.clone();
-
-        let mut state = MpvPlaybackState::default();
-        state.current_index = self.state.current_playback_state.current_index;
-        state.volume = self.state.current_playback_state.volume;
-        state.last_index = self.state.current_playback_state.last_index;
-        state.position = self.state.current_playback_state.position;
-        state.duration = self.state.current_playback_state.duration;
-
-        self.mpv_thread = Some(thread::spawn(move || {
-            if let Err(e) = Self::t_playlist(songs, mpv_state, sender, state, repeat) {
-                log::error!("Error in mpv playlist thread: {}", e);
-            }
-        }));
-
-        self.paused = false;
-
-        Ok(())
-    }
-
-    /// The thread that keeps in sync with the mpv thread
-    fn t_playlist(
-        songs: Vec<Song>,
-        mpv_state: Arc<Mutex<MpvState>>,
-        sender: Sender<MpvPlaybackState>,
-        state: MpvPlaybackState,
-        repeat: Repeat,
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let mpv = mpv_state
-            .lock()
-            .map_err(|e| format!("Failed to lock mpv_state: {:?}", e))?;
-
-        let _ = mpv.mpv.command("playlist_clear", &["force"]);
-
-        for song in songs {
-            match helpers::normalize_mpvsafe_url(&song.url) {
-                Ok(safe_url) => {
-                    let _ = mpv
-                        .mpv
-                        .command("loadfile", &[safe_url.as_str(), "append-play"]);
-                }
-                Err(e) => log::error!("Failed to normalize URL '{}': {:?}", song.url, e),
-            }
-        }
-
-        mpv.mpv.set_property("volume", state.volume)?;
-        mpv.mpv.set_property("playlist-pos", state.current_index)?;
-
-        match repeat {
-            Repeat::None => {
-                let _ = mpv.mpv.set_property("loop-file", "no");
-                let _ = mpv.mpv.set_property("loop-playlist", "no");
-            }
-            Repeat::All => {
-                let _ = mpv.mpv.set_property("loop-playlist", "inf");
-            }
-            Repeat::One => {
-                let _ = mpv.mpv.set_property("loop-playlist", "no");
-                let _ = mpv.mpv.set_property("loop-file", "inf");
-            }
-        }
-
-        drop(mpv);
-
-        let mut last = state;
-
-        loop {
-            // main mpv loop
-            let mpv = mpv_state
-                .lock()
-                .map_err(|e| format!("Failed to lock mpv_state: {:?}", e))?;
-
-            let position = mpv.mpv.get_property("time-pos").unwrap_or(0.0);
-            let current_index: i64 = mpv.mpv.get_property("playlist-pos").unwrap_or(0);
-            let duration = mpv.mpv.get_property("duration").unwrap_or(0.0);
-            let volume = mpv.mpv.get_property("volume").unwrap_or(0);
-            let audio_bitrate = mpv.mpv.get_property("audio-bitrate").unwrap_or(0);
-            let audio_samplerate = mpv.mpv.get_property("audio-params/samplerate").unwrap_or(0);
-            // let audio_channels = mpv.mpv.get_property("audio-params/channel-count").unwrap_or(0);
-            // let audio_format: String = mpv.mpv.get_property("audio-params/format").unwrap_or_default();
-            let hr_channels: String = mpv
-                .mpv
-                .get_property("audio-params/hr-channels")
-                .unwrap_or_default();
-
-            let file_format: String = mpv.mpv.get_property("file-format").unwrap_or_default();
-            drop(mpv);
-
-            if (position - last.position).abs() < 0.95
-                && (duration - last.duration).abs() < 0.95
-                && current_index == last.current_index
-                && volume == last.volume
-            {
-                thread::sleep(Duration::from_secs_f32(0.2));
-                continue;
-            }
-
-            last = MpvPlaybackState {
-                position,
-                duration,
-                current_index,
-                last_index: last.last_index,
-                volume,
-                audio_bitrate,
-                audio_samplerate,
-                hr_channels,
-                file_format: file_format.to_string(),
-            };
-
-            let _ = sender.send(last.clone());
-
-            thread::sleep(Duration::from_secs_f32(0.2));
-        }
-    }
-
     async fn get_cover_art(
         &mut self,
         song: &Song,
@@ -2476,12 +2305,21 @@ impl App {
             }
         }
 
+        // first tell mpv which tracks to load and to wait paused
         let _ = self.mpv_start_playlist().await;
 
-        if let Ok(mpv) = self.mpv_state.lock() {
-            let _ = mpv.mpv.set_property("pause", true);
-            self.paused = true;
-        }
+        let mut state = MpvPlaybackState::default();
+        state.current_index = self.state.current_playback_state.current_index;
+        state.volume = self.state.current_playback_state.volume;
+        state.last_index = self.state.current_playback_state.last_index;
+        state.position = self.state.current_playback_state.position;
+        state.duration = self.state.current_playback_state.duration;
+
+        // then initialize some defaults like volume etc
+        self.mpv_send(|reply| MpvCommand::LoadState {
+            state: self.state.current_playback_state.clone(),
+            reply,
+        }).await?;
 
         // unfortunately while transcoding it doesn't know the duration immediately and stalls
         if self.state.current_playback_state.position > 0.1 && !self.transcoding.enabled {

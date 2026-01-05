@@ -14,6 +14,7 @@ mod search;
 mod sort;
 mod themes;
 mod tui;
+mod mpv;
 
 use std::env;
 use std::panic;
