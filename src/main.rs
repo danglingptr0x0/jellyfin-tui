@@ -15,6 +15,7 @@ mod playlists;
 mod popup;
 mod queue;
 mod search;
+mod socket;
 mod sort;
 mod themes;
 mod tui;
@@ -171,6 +172,7 @@ async fn main() {
     if panicked.load(Ordering::SeqCst) {
         return;
     }
+    socket::cleanup_socket();
     println!(" - Exiting...");
 }
 

@@ -275,6 +275,8 @@ pub struct App {
     pub db: DatabaseWrapper,
 
     pub last_term_size: (u16, u16), // Last known terminal size used to trigger full redraw
+    pub socket_rx: std::sync::mpsc::Receiver<(crate::socket::SocketCommand, tokio::sync::oneshot::Sender<crate::socket::SocketResponse>)>,
+    pub socket_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl App {
@@ -292,6 +294,11 @@ impl App {
         let (cmd_tx, cmd_rx) = mpsc::channel::<database::database::Command>(64);
         let (status_tx, status_rx) = mpsc::channel::<database::database::Status>(64);
         let (mpris_tx, mpris_rx) = channel::<MediaControlEvent>();
+
+        let (socket_tx, socket_rx) = channel::<(crate::socket::SocketCommand, tokio::sync::oneshot::Sender<crate::socket::SocketResponse>)>();
+        let socket_thread = Some(thread::spawn(move || {
+            crate::socket::t_socket(socket_tx);
+        }));
 
         // try to go online, construct the http client
         let mut client: Option<Arc<Client>> = None;
@@ -532,6 +539,8 @@ impl App {
             db,
 
             last_term_size: (0, 0),
+            socket_rx,
+            socket_thread,
         }
     }
 }
@@ -1073,6 +1082,7 @@ impl App {
         self.handle_events().await?;
 
         self.handle_mpris_events().await;
+        self.handle_socket_events().await;
 
         self.handle_state_autosave();
 
